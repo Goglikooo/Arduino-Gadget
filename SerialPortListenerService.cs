@@ -1,144 +1,73 @@
-﻿using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.DependencyInjection;
+﻿using ArduinoBackend;
 using ArduinoBackend.Data;
 using ArduinoBackend.Models;
+using Microsoft.AspNetCore.SignalR;
 using System.IO.Ports;
 
-namespace ArduinoBackend
+public class SerialPortListenerService : BackgroundService
 {
-    public class SerialPortListenerService : BackgroundService
+    private readonly IServiceProvider _services;
+    private readonly IHubContext<SensorHub> _hubContext;
+
+    public SerialPortListenerService(IServiceProvider services, IHubContext<SensorHub> hubContext)
     {
-        private readonly IServiceProvider _services;
-        private readonly string _portName = "COM3"; // <-- Change if needed
-        private readonly int _baudRate = 9600;
-        private readonly List<SensorRecord> buffer = new();
-        private (int H, int T, int S)? lastRecord = null; // For duplicate filtering
+        _services = services;
+        _hubContext = hubContext;
+    }
 
-        public SerialPortListenerService(IServiceProvider services)
+    protected override Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        return Task.Run(async () =>
         {
-            _services = services;
-        }
-
-        protected override Task ExecuteAsync(CancellationToken stoppingToken)
-        {
-            return Task.Run(() =>
+            using var port = new SerialPort("COM3", 9600)
             {
-                SerialPort? port = null;
+                NewLine = "\n",
+                DtrEnable = true,
+                RtsEnable = true
+            };
+            port.Open();
+            Console.WriteLine("✅ Connected to Arduino");
 
-                // --- Try to connect to COM3 until successful ---
-                while (!stoppingToken.IsCancellationRequested)
+            var dbBuffer = new List<SensorRecord>();
+            DateTime lastSave = DateTime.Now;
+
+            while (!stoppingToken.IsCancellationRequested)
+            {
+                if (port.BytesToRead > 0)
                 {
-                    try
+                    string line = port.ReadLine().Trim();
+                    if (!line.StartsWith("DATA:")) continue;
+
+                    var parts = line.Substring(5).Split(',');
+                    if (parts.Length != 3) continue;
+
+                    if (int.TryParse(parts[0], out int h) &&
+                        int.TryParse(parts[1], out int t) &&
+                        int.TryParse(parts[2], out int s))
                     {
-                        port = new SerialPort(_portName, _baudRate)
+                        var record = new SensorRecord { Humidity = h, Temperature = t, SoundLevel = s };
+
+                        // 1️⃣ Send live to all dashboard clients via SignalR
+                        await _hubContext.Clients.All.SendAsync("ReceiveSensorData", record);
+
+                        // 2️⃣ Optional: save to DB asynchronously in batches every 10 records or 10s
+                        dbBuffer.Add(record);
+                        if (dbBuffer.Count >= 10 || (DateTime.Now - lastSave).TotalSeconds > 10)
                         {
-                            NewLine = "\n",
-                            ReadTimeout = 2000,
-                            DtrEnable = true,
-                            RtsEnable = true
-                        };
-
-                        port.Open();
-                        Console.WriteLine($"✅ Connected to Arduino on {_portName}");
-                        Thread.Sleep(3000); // Give Arduino time to reset
-                        break;
-                    }
-                    catch (UnauthorizedAccessException)
-                    {
-                        Console.WriteLine($"⚠️  Access denied to {_portName}. Close Arduino IDE or Serial Monitor.");
-                        Thread.Sleep(2000);
-                    }
-                    catch (Exception)
-                    {
-                        Console.WriteLine($"Waiting for {_portName}...");
-                        Thread.Sleep(2000);
-                    }
-                }
-
-                if (port == null)
-                {
-                    Console.WriteLine("❌ Could not open serial port.");
-                    return;
-                }
-
-                DateTime lastSave = DateTime.Now;
-
-                // --- Main reading loop ---
-                while (!stoppingToken.IsCancellationRequested)
-                {
-                    try
-                    {
-                        if (port.BytesToRead > 0)
-                        {
-                            string line = port.ReadLine().Trim();
-                            Console.WriteLine($"📥 Received raw: {line}");
-
-                            if (!line.StartsWith("DATA:")) continue;
-
-                            var parts = line.Substring(5).Split(',');
-                            if (parts.Length != 3) continue;
-
-                            if (int.TryParse(parts[0], out int h) &&
-                                int.TryParse(parts[1], out int t) &&
-                                int.TryParse(parts[2], out int s))
-                            {
-                                // Skip duplicates
-                                if (lastRecord == (h, t, s))
-                                    continue;
-
-                                lastRecord = (h, t, s);
-
-                                var record = new SensorRecord
-                                {
-                                    Humidity = h,
-                                    Temperature = t,
-                                    SoundLevel = s
-                                };
-
-                                buffer.Add(record);
-                                Console.WriteLine($"🟢 Queued: H={h}, T={t}, S={s}");
-
-                                // Flush every 100 records or every 10 seconds
-                                if (buffer.Count >= 100 ||
-                                    (DateTime.Now - lastSave).TotalSeconds > 10)
-                                {
-                                    using var scope = _services.CreateScope();
-                                    var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-
-                                    db.SensorRecords.AddRange(buffer);
-                                    db.SaveChanges();
-
-                                    Console.WriteLine($"💾 Saved {buffer.Count} records to DB");
-                                    buffer.Clear();
-                                    lastSave = DateTime.Now;
-                                }
-                            }
-                        }
-                        else
-                        {
-                            Console.WriteLine("...waiting for data...");
-                            Thread.Sleep(1000);
+                            using var scope = _services.CreateScope();
+                            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+                            db.SensorRecords.AddRange(dbBuffer);
+                            await db.SaveChangesAsync();
+                            dbBuffer.Clear();
+                            lastSave = DateTime.Now;
                         }
                     }
-                    catch (TimeoutException)
-                    {
-                        // Ignore timeout, Arduino just not sending
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"Serial error: {ex.Message}");
-                    }
                 }
-
-                // --- Cleanup on shutdown ---
-                try
+                else
                 {
-                    port.Close();
-                    port.Dispose();
-                    Console.WriteLine("🔌 Serial port closed cleanly.");
+                    await Task.Delay(50); // Small delay to avoid CPU hog
                 }
-                catch { }
-            }, stoppingToken);
-        }
+            }
+        });
     }
 }

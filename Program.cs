@@ -5,24 +5,39 @@ using ArduinoBackend;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// Add EF Core SQLite
+// --- Add EF Core SQLite ---
 builder.Services.AddDbContext<AppDbContext>(options =>
     options.UseSqlite("Data Source=sensors.db"));
 
-// Add CORS for React frontend
+// --- Add CORS for React frontend ---
 builder.Services.AddCors(options =>
 {
     options.AddPolicy("AllowReactApp",
-        policy => policy.AllowAnyOrigin().AllowAnyMethod().AllowAnyHeader());
+         policy => policy
+             .SetIsOriginAllowed(origin => origin.StartsWith("http://localhost"))
+             .AllowCredentials()
+             .AllowAnyHeader()
+             .AllowAnyMethod());
 });
 
-// Add SerialPort background service
+// --- Add SignalR ---
+
+
+
+
+builder.Services.AddSignalR();
+
+// --- Add SerialPort background service (after SignalR) ---
 builder.Services.AddHostedService<SerialPortListenerService>();
 
 var app = builder.Build();
 
+
+
+// --- Use CORS BEFORE SignalR & endpoints ---
 app.UseCors("AllowReactApp");
-app.UseHttpsRedirection();
+
+//app.UseHttpsRedirection();
 
 // --- Minimal API endpoints ---
 app.MapGet("/api/sensors", async (AppDbContext db) =>
@@ -34,5 +49,8 @@ app.MapGet("/api/sensors/latest", async (AppDbContext db) =>
 {
     return await db.SensorRecords.OrderByDescending(x => x.Timestamp).FirstOrDefaultAsync();
 });
+
+// --- Map SignalR hub ---
+app.MapHub<SensorHub>("/sensorhub");
 
 app.Run();
